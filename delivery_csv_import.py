@@ -225,8 +225,11 @@ def import_csv_to_excel(excel_path: str, csv_path: str) -> dict:
             _set("docket_volume",
                  "=IF(%s>35000,40000,34000)" % vol_ref,
                  number_format=_DOCKET_VOL_FMT)
+            # Convencion historica del Excel: Variance = Volume - Docket
+            # (NEGATIVO cuando hay merma). El % = Variance/Docket conserva el
+            # mismo signo.
             _set("variance",
-                 "=Table1[[#This Row],[Docket Volume]]-%s" % vol_ref,
+                 "=%s-Table1[[#This Row],[Docket Volume]]" % vol_ref,
                  number_format=_VARIANCE_FMT)
             _set("variance_pct",
                  "=Table1[[#This Row],[Variance]]/"

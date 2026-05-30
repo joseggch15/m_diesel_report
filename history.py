@@ -257,6 +257,20 @@ class MonthlyHistory:
             self._read_deliveries(wb[dt_sheet])
 
     def _read_deliveries(self, ws) -> None:
+        """Lee tickets confirmados de la hoja delivery_transaction_*.
+
+        Importante: las columnas Docket Volume, Variance y % son FORMULAS en
+        Excel. Cuando se leen con openpyxl/data_only, devuelven el valor
+        cacheado en el archivo; si la formula no fue recalculada por Excel
+        despues de un import via openpyxl, ese cache es None y el reporte
+        terminaba con todos los % en 0.
+
+        Para que el reporte funcione siempre, calculamos Docket/Variance/% a
+        partir de Volume aplicando la misma logica de las formulas del Excel:
+          - docket = 40000 si volume > 35000, de lo contrario 34000.
+          - variance = volume - docket  (convencion historica: NEGATIVO
+            cuando hay merma, i.e. volume < docket).
+          - pct = variance / docket * 100  (porcentaje con signo)."""
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row:
                 continue
@@ -267,14 +281,11 @@ class MonthlyHistory:
                     str(row[DT_CONFIRMED]).strip().lower() != "yes":
                 continue
             volume = m._num(row[DT_VOLUME]) if len(row) > DT_VOLUME else 0.0
-            docket = m._num(row[DT_DOCKET_VOL]) \
-                if len(row) > DT_DOCKET_VOL and row[DT_DOCKET_VOL] is not None \
-                else (40000.0 if volume > 35000 else 34000.0)
-            pct_raw = m._num(row[DT_PCT]) if len(row) > DT_PCT \
-                and row[DT_PCT] is not None else 0.0
-            # Si el campo % esta como fraccion (-0.0046), normalizamos a %.
-            # Si ya viene en %, lo dejamos.
-            pct = pct_raw * 100.0 if -1.0 < pct_raw < 1.0 else pct_raw
+            # Computamos siempre desde Volume; ignoramos celdas con formulas
+            # cuyo cache puede ser None.
+            docket = 40000.0 if volume > 35000 else 34000.0
+            variance = volume - docket
+            pct = (variance / docket) * 100.0 if docket else 0.0
             self._deliveries.append({
                 "dt": collected if isinstance(collected, datetime.datetime)
                     else datetime.datetime.combine(collected, datetime.time()),
