@@ -103,7 +103,17 @@ class _BackgroundWorker(QThread):
 
 def _run_with_progress(parent, title: str, message: str,
                         func, *args, **kwargs):
+    """Corre `func` en un hilo aparte con una barra de progreso modal.
+
+    Si `func` acepta un argumento `progress_cb(i, total, label="")`, se le
+    inyecta uno que actualiza la barra a porcentaje real, de forma segura
+    entre hilos (Qt requiere actualizar widgets desde el hilo de la GUI).
+    Si no lo acepta, la barra queda indeterminada (animada)."""
+    from PySide6.QtCore import QMetaObject, Q_ARG
+    import inspect
+
     holder: dict = {"result": None, "error": None}
+
     dlg = QProgressDialog(message, None, 0, 0, parent)
     dlg.setWindowTitle(title)
     dlg.setWindowModality(Qt.ApplicationModal)
@@ -111,9 +121,38 @@ def _run_with_progress(parent, title: str, message: str,
     dlg.setAutoClose(False)
     dlg.setAutoReset(False)
     dlg.setCancelButton(None)
-    dlg.setMinimumWidth(420)
+    dlg.setWindowFlags(
+        (dlg.windowFlags() | Qt.CustomizeWindowHint)
+        & ~Qt.WindowCloseButtonHint
+        & ~Qt.WindowContextHelpButtonHint)
+    dlg.setMinimumWidth(440)
 
-    worker = _BackgroundWorker(func, args, kwargs, holder)
+    sig_kwargs = dict(kwargs)
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    if "progress_cb" in params:
+        def _cb(i, total, label=""):
+            try:
+                total_i = max(1, int(total))
+                cur = max(0, min(int(i), total_i))
+            except (TypeError, ValueError):
+                return
+            QMetaObject.invokeMethod(
+                dlg, "setMaximum", Qt.QueuedConnection,
+                Q_ARG(int, total_i))
+            QMetaObject.invokeMethod(
+                dlg, "setValue", Qt.QueuedConnection,
+                Q_ARG(int, cur))
+            if label:
+                QMetaObject.invokeMethod(
+                    dlg, "setLabelText", Qt.QueuedConnection,
+                    Q_ARG(str, "%s   (%d/%d)" % (label, cur, total_i)))
+        sig_kwargs["progress_cb"] = _cb
+
+    worker = _BackgroundWorker(func, args, sig_kwargs, holder)
     worker.finished.connect(dlg.close)
     worker.start()
     dlg.exec()
@@ -863,6 +902,28 @@ class MainWindow(QMainWindow):
     # Slots: carga de archivos
     # ====================================================================
 
+    def _populate_date_combo(self, select_month=None):
+        """Rellena el combo "Mes disponible" con los meses de Recon_LFO.
+
+        Si `select_month` es una fecha (1er dia del mes), se selecciona ese
+        mes despues de repoblar; de lo contrario se conserva el mes que
+        estaba seleccionado antes."""
+        prev_iso = self.date_combo.currentData() if not select_month else None
+        self.date_combo.blockSignals(True)
+        try:
+            self.date_combo.clear()
+            for m_first in self.history.available_months():
+                self.date_combo.addItem(m.format_month_label(m_first),
+                                         m_first.isoformat())
+            target_iso = (select_month.isoformat()
+                           if select_month is not None else prev_iso)
+            if target_iso:
+                idx = self.date_combo.findData(target_iso)
+                if idx >= 0:
+                    self.date_combo.setCurrentIndex(idx)
+        finally:
+            self.date_combo.blockSignals(False)
+
     def _on_load_history(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Cargar Excel historico", "",
@@ -871,7 +932,11 @@ class MainWindow(QMainWindow):
             return
         try:
             self.history = history.MonthlyHistory()
-            self.history.load(path)
+            _run_with_progress(
+                self, "Cargando Excel historico",
+                "Leyendo  %s ...\n\nPor favor espere, el archivo puede "
+                "ser grande." % os.path.basename(path),
+                self.history.load, path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo leer el Excel:\n%s" % exc)
@@ -881,10 +946,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Sin datos",
                                  "El Excel no contiene meses en Recon_LFO.")
             return
-        self.date_combo.clear()
-        for m_first in months:
-            self.date_combo.addItem(m.format_month_label(m_first),
-                                     m_first.isoformat())
+        self._populate_date_combo()
         self.statusBar().showMessage(
             "Excel historico cargado: %d meses." % len(months))
         self._refresh_load_status()
@@ -918,7 +980,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            trends, safe = stock_trend.load_tank_trends(path)
+            trends, safe = _run_with_progress(
+                self, "Cargando tendencia de tanques",
+                "Leyendo %s..." % os.path.basename(path),
+                stock_trend.load_tank_trends, path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo leer el CSV:\n%s" % exc)
@@ -940,6 +1005,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Stock trend cargado: %d puntos." %
                                       len(pts))
 
+    @staticmethod
+    def _month_first_from_period_end(period_end: str):
+        """Convierte el `period_end` del PDF Veridapt (formato dd/mm/yyyy) en
+        el 1er dia del mes reportado. Devuelve None si no se puede parsear."""
+        if not period_end:
+            return None
+        try:
+            end_d = datetime.datetime.strptime(period_end, "%d/%m/%Y").date()
+        except ValueError:
+            return None
+        if end_d.day == 1:
+            # period_end es el 1er dia del mes SIGUIENTE al reportado.
+            if end_d.month == 1:
+                return end_d.replace(year=end_d.year - 1, month=12, day=1)
+            return end_d.replace(month=end_d.month - 1, day=1)
+        # period_end es el ultimo dia del mes reportado.
+        return end_d.replace(day=1)
+
     def _on_load_pdf(self):
         if not pdf_import.is_available():
             QMessageBox.warning(self, "Falta pdfplumber",
@@ -949,43 +1032,153 @@ class MainWindow(QMainWindow):
             self, "Cargar PDFs Veridapt", "", "PDF files (*.pdf)")
         if not paths:
             return
-        loaded, skipped = pdf_import.parse_multiple_pdfs(paths)
+        try:
+            loaded, skipped = _run_with_progress(
+                self, "Cargando PDFs Veridapt",
+                "Leyendo %d PDF(s)..." % len(paths),
+                pdf_import.parse_multiple_pdfs, paths)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error",
+                                  "Fallo al leer los PDFs:\n%s" % exc)
+            return
         self.pdf_loaded_files = paths
-        # Si tenemos Excel historico y se puede determinar el mes:
-        if loaded and self.history.is_loaded():
-            # Asume que todos los PDFs corresponden al mismo periodo.
-            first_info = loaded[0][1]
-            period_end = first_info.get("period_end", "")
-            # period_end = '01/05/2026' -> mes = abril
-            try:
-                end_d = datetime.datetime.strptime(
-                    period_end, "%d/%m/%Y").date()
-                if end_d.day == 1:
-                    # Es el primer dia del mes siguiente al reportado.
-                    if end_d.month == 1:
-                        month_first = end_d.replace(year=end_d.year - 1,
-                                                     month=12, day=1)
-                    else:
-                        month_first = end_d.replace(month=end_d.month - 1,
-                                                     day=1)
-                else:
-                    # period_end es el ultimo dia del mes reportado.
-                    month_first = end_d.replace(day=1)
-            except ValueError:
-                month_first = None
 
-            if month_first is not None:
-                items = [(site, month_first, info) for site, info, _ in loaded]
-                results, errors = excel_writer.write_multiple(
-                    self.history.source_path, items)
+        if loaded and self.history.is_loaded():
+            # 1) Determinar el mes reportado para CADA PDF y avisar si no
+            # todos pertenecen al mismo mes.
+            per_pdf_month = []
+            unparseable = []
+            for site, info, fname in loaded:
+                mf = self._month_first_from_period_end(
+                    info.get("period_end", ""))
+                if mf is None:
+                    unparseable.append((site, fname,
+                                         info.get("period_end", "")))
+                else:
+                    per_pdf_month.append((site, fname, mf, info))
+
+            if unparseable:
+                lines = ["No se pudo determinar el mes de estos PDFs:"]
+                for site, fname, raw in unparseable:
+                    lines.append("  - %s (%s): period_end=%r"
+                                 % (site, fname, raw))
+                lines.append("\nEstos PDFs NO se escribiran al Excel "
+                              "historico.")
+                QMessageBox.warning(self, "Fecha del PDF no reconocida",
+                                     "\n".join(lines))
+
+            month_first = None
+            if per_pdf_month:
+                unique_months = sorted({mf for _, _, mf, _ in per_pdf_month})
+                if len(unique_months) > 1:
+                    lines = ["Los PDFs cargados pertenecen a meses distintos:"]
+                    for mf in unique_months:
+                        sites = [s for s, _, mf2, _ in per_pdf_month
+                                 if mf2 == mf]
+                        lines.append("  - %s: %s"
+                                     % (m.format_month_label(mf),
+                                        ", ".join(sites)))
+                    lines.append("\n¿Desea continuar y escribir cada PDF "
+                                  "en su mes correspondiente?")
+                    if QMessageBox.question(
+                            self, "PDFs de meses distintos",
+                            "\n".join(lines),
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No) != QMessageBox.Yes:
+                        per_pdf_month = []
+                else:
+                    month_first = unique_months[0]
+
+            if per_pdf_month:
+                items = [(site, mf, info)
+                         for site, _, mf, info in per_pdf_month]
+
+                # 2) Detectar filas legacy (del bug anterior: datos del mes N
+                # grabados en la fila 1/N en vez de 1/N+1).
+                try:
+                    legacy = excel_writer.detect_legacy_rows(
+                        self.history.source_path, items)
+                except Exception as exc:
+                    legacy = []
+                    QMessageBox.warning(
+                        self, "Aviso",
+                        "No se pudo verificar filas legacy:\n%s" % exc)
+
+                if legacy:
+                    lines = ["Se detectaron filas en el Excel que parecen "
+                              "ser del bug anterior (datos del mes grabados "
+                              "en la fecha equivocada):"]
+                    for lr in legacy:
+                        lines.append(
+                            "  - %s, fila %d, fecha %s (deberia ser %s)" % (
+                                lr["sheet_name"], lr["row"],
+                                lr["legacy_date"].strftime("%d/%m/%Y"),
+                                lr["correct_date"].strftime("%d/%m/%Y")))
+                    lines.append("\n¿Desea borrar esas filas legacy "
+                                  "antes de escribir las nuevas?\n\n"
+                                  "Si  = borrar y continuar (recomendado).\n"
+                                  "No  = dejar como estan y continuar.\n"
+                                  "Cancelar = no escribir nada.")
+                    choice = QMessageBox.question(
+                        self, "Filas legacy detectadas",
+                        "\n".join(lines),
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                        QMessageBox.Yes)
+                    if choice == QMessageBox.Cancel:
+                        per_pdf_month = []
+                        items = []
+                    elif choice == QMessageBox.Yes:
+                        try:
+                            n = excel_writer.remove_rows(
+                                self.history.source_path, legacy)
+                            self.statusBar().showMessage(
+                                "Filas legacy borradas: %d." % n)
+                        except Exception as exc:
+                            QMessageBox.critical(
+                                self, "Error",
+                                "No se pudieron borrar las filas legacy:\n%s"
+                                % exc)
+                            items = []
+
+            if items:
+                try:
+                    results, errors = _run_with_progress(
+                        self, "Escribiendo Excel historico",
+                        "Actualizando hojas Recon_LFO / Recon_FuelTank...",
+                        excel_writer.write_multiple,
+                        self.history.source_path, items)
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Error",
+                        "No se pudo escribir al Excel historico:\n%s" % exc)
+                    return
                 if errors:
                     QMessageBox.warning(
                         self, "Errores escribiendo Excel",
                         "Errores:\n" + "\n".join(
                             "%s: %s" % (k, v) for k, v in errors))
-                # Recargar el Excel para refrescar los datos.
+                # 3) Si alguna fila tenia datos PREVIOS distintos a los del
+                # PDF, avisamos: el usuario sobreescribio un mes ya cargado.
+                overwritten = [r for (_, r) in results
+                                if r.get("action") == "overwrite_diff"]
+                if overwritten:
+                    lines = ["Las siguientes filas tenian datos DISTINTOS y "
+                              "fueron sobreescritas con los del PDF:"]
+                    for r in overwritten:
+                        lines.append("  - %s (fila %s)"
+                                     % (r.get("site"), r.get("row")))
+                    lines.append("\nSi esto es un error, recupere la version "
+                                  "previa del Excel desde su respaldo.")
+                    QMessageBox.warning(
+                        self, "Datos sobreescritos", "\n".join(lines))
+                # Recargar el Excel para refrescar los datos y poner el mes
+                # recien escrito en el combo "Mes disponible".
                 try:
-                    self.history.load(self.history.source_path)
+                    _run_with_progress(
+                        self, "Recargando Excel historico",
+                        "Refrescando datos...",
+                        self.history.load, self.history.source_path)
+                    self._populate_date_combo(select_month=month_first)
                 except Exception as exc:
                     QMessageBox.warning(self, "Aviso",
                                          "PDFs aplicados, pero al recargar:\n%s"
@@ -1010,16 +1203,24 @@ class MainWindow(QMainWindow):
                                  "Primero cargue el Excel historico.")
             return
         try:
-            info = delivery_csv_import.import_csv_to_excel(
+            info = _run_with_progress(
+                self, "Importando CSV de deliveries",
+                "Leyendo CSV y escribiendo al Excel historico...",
+                delivery_csv_import.import_csv_to_excel,
                 self.history.source_path, path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo importar el CSV:\n%s" % exc)
             return
         self.delivery_csv_path = path
-        # Recargar el Excel para incluir los nuevos tickets.
+        # Recargar el Excel para incluir los nuevos tickets y refrescar el
+        # combo "Mes disponible" por si la importacion agrego una hoja nueva.
         try:
-            self.history.load(self.history.source_path)
+            _run_with_progress(
+                self, "Recargando Excel historico",
+                "Refrescando datos...",
+                self.history.load, self.history.source_path)
+            self._populate_date_combo()
         except Exception as exc:
             QMessageBox.warning(self, "Aviso",
                                  "CSV aplicado, pero al recargar:\n%s" % exc)
@@ -1038,7 +1239,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self.data = m.load_excel(path)
+            self.data = _run_with_progress(
+                self, "Cargando Excel de entrada",
+                "Leyendo %s..." % os.path.basename(path),
+                m.load_excel, path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo cargar el Excel:\n%s" % exc)
@@ -1053,7 +1257,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            m.save_excel(m.default_data(), path)
+            _run_with_progress(
+                self, "Creando Excel en blanco",
+                "Escribiendo %s..." % os.path.basename(path),
+                m.save_excel, m.default_data(), path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo crear el Excel:\n%s" % exc)
@@ -1068,7 +1275,10 @@ class MainWindow(QMainWindow):
             return
         data = self._collect_data()
         try:
-            m.save_excel(data, path)
+            _run_with_progress(
+                self, "Guardando Excel de entrada",
+                "Escribiendo %s..." % os.path.basename(path),
+                m.save_excel, data, path)
         except Exception as exc:
             QMessageBox.critical(self, "Error",
                                   "No se pudo guardar:\n%s" % exc)
@@ -1119,7 +1329,10 @@ class MainWindow(QMainWindow):
                 month_first = datetime.date.fromisoformat(iso)
                 deliv_pct = m.delivery_pct_value(data["deliveries_daily"])
                 recon_pct = m.recon_pct_value(data["consolidated"])
-                monthly_variance_writer.upsert_month(
+                _run_with_progress(
+                    self, "Actualizando Monthly Variance",
+                    "Escribiendo % de entrega y reconciliacion del mes...",
+                    monthly_variance_writer.upsert_month,
                     self.history.source_path, month_first,
                     deliv_pct, recon_pct)
         except Exception as exc:

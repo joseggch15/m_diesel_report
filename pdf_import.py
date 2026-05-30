@@ -192,11 +192,17 @@ def parse_veridapt_pdf(path: str) -> dict:
     return result
 
 
-def parse_multiple_pdfs(paths: list) -> tuple:
+def parse_multiple_pdfs(paths: list, progress_cb=None) -> tuple:
     loaded = []
     skipped = []
-    for path in paths:
+    total = len(paths)
+    for i, path in enumerate(paths, start=1):
         fname = os.path.basename(path)
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total, "Leyendo %s" % fname)
+            except Exception:
+                pass
         try:
             info = parse_veridapt_pdf(path)
         except Exception as exc:
