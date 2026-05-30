@@ -507,6 +507,13 @@ def main():
     purge = purge_chart_parts(out)
     print("Purga de partes de chart: %s" % purge)
 
+    # 10) Desenvolver el control de contenido invalido del encabezado (un
+    #     control de texto/Title que envuelve el logo). Es la causa real del
+    #     aviso de Word "contenido no legible" heredado del reporte original.
+    from report_model import sanitize_content_controls
+    n_sdt = sanitize_content_controls(out)
+    print("Controles de contenido invalidos desenvueltos: %d." % n_sdt)
+
     print("Plantilla generada correctamente: %s" % out)
 
 

@@ -20,12 +20,129 @@ import datetime
 import os
 import shutil
 import tempfile
+import zipfile
 
 import openpyxl
-from docxtpl import DocxTemplate, InlineImage, RichText
+from docxtpl import DocxTemplate, InlineImage
+from docxtpl import RichText as _DocxRichText
 from docx.shared import Mm
 
 import charts
+
+
+# --------------------------------------------------------------------------
+# RichText con orden de propiedades valido segun el esquema OOXML
+# --------------------------------------------------------------------------
+#
+# docxtpl 0.20.x emite las propiedades de run (<w:rPr>) en un orden que no
+# respeta la secuencia obligatoria del esquema CT_RPr de OOXML: por ejemplo
+# pone <w:b/> antes de <w:rFonts/>. El esquema exige que <w:rFonts/> vaya
+# ANTES de <w:b/>, <w:color/>, <w:sz/>, etc. Word valida ese orden y, cuando
+# no se cumple, muestra el dialogo "Word encontro contenido no legible... el
+# desea recuperar el contenido?" al abrir el .docx.
+#
+# Esta subclase reescribe `add` para generar las propiedades en el orden que
+# manda el esquema, eliminando ese mensaje. El resto del comportamiento es
+# identico al de docxtpl.
+
+try:
+    from html import escape as _xml_escape
+except ImportError:  # pragma: no cover
+    from cgi import escape as _xml_escape
+
+
+class RichText(_DocxRichText):
+    """RichText de docxtpl con el orden de <w:rPr> corregido."""
+
+    def add(
+        self,
+        text,
+        style=None,
+        color=None,
+        highlight=None,
+        size=None,
+        subscript=None,
+        superscript=None,
+        bold=False,
+        italic=False,
+        underline=False,
+        strike=False,
+        font=None,
+        url_id=None,
+        rtl=False,
+        lang=None,
+    ):
+        # Si se agrega otro RichText, concatenar su XML tal cual.
+        if isinstance(text, _DocxRichText):
+            self.xml += text.xml
+            return
+
+        if not isinstance(text, (str, bytes)):
+            text = str(text)
+        if not isinstance(text, str):
+            text = text.decode("utf-8", errors="ignore")
+        text = _xml_escape(text)
+
+        # Las propiedades se emiten en el orden de la secuencia CT_RPr:
+        # rStyle -> rFonts -> b/bCs -> i/iCs -> strike -> color -> sz/szCs
+        # -> highlight(shd) -> u -> vertAlign -> rtl -> lang
+        prop = ""
+        if style:
+            prop += '<w:rStyle w:val="%s"/>' % style
+        if font:
+            regional_font = ""
+            if ":" in font:
+                region, font = font.split(":", 1)
+                regional_font = ' w:{region}="{font}"'.format(
+                    font=font, region=region)
+            prop += ('<w:rFonts w:ascii="{font}" w:hAnsi="{font}" '
+                     'w:cs="{font}"{regional_font}/>').format(
+                font=font, regional_font=regional_font)
+        if bold:
+            prop += "<w:b/>"
+            if rtl:
+                prop += "<w:bCs/>"
+        if italic:
+            prop += "<w:i/>"
+            if rtl:
+                prop += "<w:iCs/>"
+        if strike:
+            prop += "<w:strike/>"
+        if color:
+            if color[0] == "#":
+                color = color[1:]
+            prop += '<w:color w:val="%s"/>' % color
+        if size:
+            prop += '<w:sz w:val="%s"/>' % size
+            prop += '<w:szCs w:val="%s"/>' % size
+        if highlight:
+            if highlight[0] == "#":
+                highlight = highlight[1:]
+            prop += '<w:shd w:fill="%s"/>' % highlight
+        if underline:
+            if underline not in [
+                "single", "double", "thick", "dotted", "dash",
+                "dotDash", "dotDotDash", "wave",
+            ]:
+                underline = "single"
+            prop += '<w:u w:val="%s"/>' % underline
+        if subscript:
+            prop += '<w:vertAlign w:val="subscript"/>'
+        if superscript:
+            prop += '<w:vertAlign w:val="superscript"/>'
+        if rtl:
+            prop += '<w:rtl w:val="true"/>'
+        if lang:
+            prop += '<w:lang w:val="%s"/>' % lang
+
+        xml = "<w:r>"
+        if prop:
+            xml += "<w:rPr>%s</w:rPr>" % prop
+        xml += '<w:t xml:space="preserve">%s</w:t></w:r>' % text
+        if url_id:
+            xml = ('<w:hyperlink r:id="%s" w:tgtFrame="_blank">%s</w:hyperlink>'
+                   % (url_id, xml))
+        self.xml += xml
 
 # --------------------------------------------------------------------------
 # Configuracion fija
@@ -815,6 +932,83 @@ def _build_auto_charts(data: dict, image_paths: dict, tmpdir: str) -> dict:
     return out
 
 
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def sanitize_content_controls(docx_path: str) -> int:
+    """Repara la causa del error de Word 'contenido no legible' heredada del
+    reporte original.
+
+    El banner del encabezado trae un control de contenido (`<w:sdt>`) de tipo
+    *texto plano* enlazado a la propiedad Title (`<w:dataBinding>`) que, en vez
+    de texto, envuelve una IMAGEN (`<w:drawing>` con el logo). Un control de
+    texto plano no puede contener un dibujo: ese modelo de contenido invalido
+    es lo que hace que Word pida "recuperar el contenido" al abrir el .docx.
+
+    La correccion desenvuelve esos controles: elimina el `<w:sdt>`/`<w:sdtPr>`
+    y deja su contenido interno (el parrafo con el logo) directamente en su
+    lugar, conservando la apariencia del encabezado.
+
+    Opera sobre document.xml y todos los headers/footers del paquete .docx.
+    Devuelve cuantos controles se desenvolvieron. Idempotente."""
+    from lxml import etree
+
+    def qn(tag):
+        return "{%s}%s" % (_W_NS, tag)
+
+    with zipfile.ZipFile(docx_path, "r") as zin:
+        infos = zin.infolist()
+        contents = {i.filename: zin.read(i.filename) for i in infos}
+
+    changed = 0
+    for name in list(contents):
+        if not (name.startswith("word/") and name.endswith(".xml")):
+            continue
+        if not ("header" in name or "footer" in name
+                or name == "word/document.xml"):
+            continue
+        try:
+            root = etree.fromstring(contents[name])
+        except etree.XMLSyntaxError:
+            continue
+        local = 0
+        for sdt in list(root.iter(qn("sdt"))):
+            pr = sdt.find(qn("sdtPr"))
+            if pr is None:
+                continue
+            is_text = pr.find(qn("text")) is not None
+            is_bound = pr.find(qn("dataBinding")) is not None
+            has_drawing = sdt.find(".//" + qn("drawing")) is not None
+            if not (has_drawing and (is_text or is_bound)):
+                continue
+            content = sdt.find(qn("sdtContent"))
+            parent = sdt.getparent()
+            if parent is None:
+                continue
+            idx = list(parent).index(sdt)
+            parent.remove(sdt)
+            if content is not None:
+                for j, child in enumerate(list(content)):
+                    parent.insert(idx + j, child)
+            local += 1
+        if local:
+            contents[name] = etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8",
+                standalone=True)
+            changed += local
+
+    if changed:
+        tmp = docx_path + ".tmp"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for i in infos:
+                zi = zipfile.ZipInfo(i.filename, date_time=i.date_time)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.external_attr = i.external_attr
+                zout.writestr(zi, contents[i.filename])
+        os.replace(tmp, docx_path)
+    return changed
+
+
 def generate_report(data: dict, image_paths: dict,
                      template_path: str, output_path: str) -> str:
     if not os.path.isfile(template_path):
@@ -830,6 +1024,10 @@ def generate_report(data: dict, image_paths: dict,
         ctx = build_context(data, images, tpl)
         tpl.render(ctx)
         tpl.save(output_path)
+        # Red de seguridad: aunque la plantilla venga limpia, garantizamos que
+        # el .docx final no arrastre el control de contenido invalido del
+        # encabezado (causa del aviso "contenido no legible" de Word).
+        sanitize_content_controls(output_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return output_path
