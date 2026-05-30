@@ -173,12 +173,32 @@ def _extend_tables_to_row(ws, target_row: int) -> None:
                 get_column_letter(max_col), target_row)
 
 
+def _to_excel_row_date(month_first: datetime.date) -> datetime.date:
+    """Convencion Veridapt del Excel: la fila que contiene los datos del mes N
+    se almacena con fecha = 1er dia del mes N+1.
+
+    Asi, los datos de Abril 2026 (`month_first = 1/04/2026` desde el PDF) van
+    a la fila con fecha `1/05/2026`. Al leer, history._previous_month_first
+    revierte el desplazamiento y vuelve a mapear esa fila a Abril."""
+    if month_first.month == 12:
+        return month_first.replace(year=month_first.year + 1, month=1, day=1)
+    return month_first.replace(month=month_first.month + 1, day=1)
+
+
 def _write_one(ws, month_first: datetime.date, site_value: str,
                info: dict) -> tuple:
-    existing = _find_row_by_date(ws, month_first)
+    # Aplicamos el +1 mes para respetar la convencion Veridapt del Excel.
+    row_date = _to_excel_row_date(month_first)
+    existing = _find_row_by_date(ws, row_date)
     if existing is not None:
         target_row = existing
-        action = "updated"
+        # Si la fila ya tiene datos y NO coinciden con `info`, marcamos como
+        # "overwrite_diff" para que la UI lo destaque en el resumen.
+        if _row_has_data(ws, target_row) and not _values_match(
+                ws, target_row, info, site_value):
+            action = "overwrite_diff"
+        else:
+            action = "updated"
     else:
         source_row = _last_data_row(ws)
         target_row = source_row + 1
@@ -188,10 +208,106 @@ def _write_one(ws, month_first: datetime.date, site_value: str,
         action = "inserted"
 
     if info.get("is_truck") or str(site_value).startswith("TFL"):
-        _write_one_truck(ws, target_row, month_first, site_value, info)
+        _write_one_truck(ws, target_row, row_date, site_value, info)
     else:
-        _write_one_lfo(ws, target_row, month_first, site_value, info)
+        _write_one_lfo(ws, target_row, row_date, site_value, info)
     return target_row, action
+
+
+def _row_has_data(ws, row_idx: int) -> bool:
+    """True si la fila tiene al menos Opening o Closing distintos de None."""
+    op = ws.cell(row=row_idx, column=_COL_OPENING).value
+    cl = ws.cell(row=row_idx, column=_COL_CLOSING).value
+    return op is not None or cl is not None
+
+
+def _values_match(ws, row_idx: int, info: dict, site_value: str,
+                  tol: float = 1.0) -> bool:
+    """True si la fila ya contiene los mismos numeros (Opening/Closing/Inflow)
+    que `info`, dentro de la tolerancia. Usado para detectar la fila legacy
+    que el bug grabo con datos de `info` en el slot equivocado."""
+    def near(a, b):
+        try:
+            return abs(float(a or 0) - float(b or 0)) <= tol
+        except (TypeError, ValueError):
+            return False
+    site_cell = ws.cell(row=row_idx, column=_COL_SITE).value
+    if site_cell is not None and str(site_cell).strip().upper() != \
+            str(site_value).strip().upper():
+        return False
+    return (near(ws.cell(row=row_idx, column=_COL_OPENING).value,
+                 info.get("opening")) and
+            near(ws.cell(row=row_idx, column=_COL_CLOSING).value,
+                 info.get("closing")) and
+            near(ws.cell(row=row_idx, column=_COL_DELIVERIES).value,
+                 info.get("inflow")))
+
+
+def detect_legacy_rows(excel_path: str, items: list) -> list:
+    """Antes del fix de convencion, el cargador de PDF grababa los datos del
+    mes N en la fila con fecha `1/N` (slot Veridapt del mes N-1). Esta funcion
+    detecta esos casos: para cada (site, month_first, info) busca una fila en
+    la fecha buggy (`month_first` sin +1 mes) cuyos valores coinciden con
+    `info`. Devuelve una lista de dicts con la info necesaria para mostrar al
+    usuario y, eventualmente, borrar la fila."""
+    try:
+        wb = openpyxl.load_workbook(excel_path, read_only=False, data_only=True)
+    except Exception:
+        return []
+    out = []
+    try:
+        for site_key, month_first, info in items:
+            target = SITE_TO_SHEET.get(site_key)
+            if target is None:
+                continue
+            sheet_name, site_value = target
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            legacy = _find_row_by_date(ws, month_first)
+            if legacy is None:
+                continue
+            if not _row_has_data(ws, legacy):
+                continue
+            if not _values_match(ws, legacy, info, site_value):
+                continue
+            out.append({
+                "site_key": site_key,
+                "sheet_name": sheet_name,
+                "row": legacy,
+                "legacy_date": month_first,
+                "correct_date": _to_excel_row_date(month_first),
+            })
+    finally:
+        wb.close()
+    return out
+
+
+def remove_rows(excel_path: str, items_to_remove: list) -> int:
+    """Borra de Excel las filas indicadas. `items_to_remove` es una lista de
+    dicts con al menos 'sheet_name' y 'row'. Devuelve cuantas filas se borraron.
+
+    Borra de abajo hacia arriba para que los indices se mantengan validos."""
+    if not items_to_remove:
+        return 0
+    _check_excel_not_locked(excel_path)
+    wb = openpyxl.load_workbook(excel_path)
+    removed = 0
+    try:
+        by_sheet = {}
+        for it in items_to_remove:
+            by_sheet.setdefault(it["sheet_name"], []).append(int(it["row"]))
+        for sheet_name, rows in by_sheet.items():
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            for r in sorted(set(rows), reverse=True):
+                ws.delete_rows(r, 1)
+                removed += 1
+        wb.save(excel_path)
+    finally:
+        wb.close()
+    return removed
 
 
 def _check_excel_not_locked(excel_path: str) -> None:

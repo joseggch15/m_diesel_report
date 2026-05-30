@@ -98,6 +98,14 @@ def _slide_chart_window(ws, last_row: int, window: int = CHART_WINDOW) -> bool:
     return changed
 
 
+def _to_excel_row_date(month_first: datetime.date) -> datetime.date:
+    """Convencion Veridapt del Excel: la fila con los % del mes N se almacena
+    con fecha = 1er dia del mes N+1 (vease history._previous_month_first)."""
+    if month_first.month == 12:
+        return month_first.replace(year=month_first.year + 1, month=1, day=1)
+    return month_first.replace(month=month_first.month + 1, day=1)
+
+
 def upsert_month(excel_path: str, month_first: datetime.date,
                   delivery_pct: float, recon_pct: float) -> dict:
     """Inserta o actualiza la fila correspondiente a `month_first` y desliza
@@ -109,7 +117,8 @@ def upsert_month(excel_path: str, month_first: datetime.date,
         return {"row": None, "action": "skipped_no_sheet"}
     ws = wb[SHEET_NAME]
 
-    existing = _find_row_for_date(ws, month_first)
+    row_date = _to_excel_row_date(month_first)
+    existing = _find_row_for_date(ws, row_date)
     if existing is not None:
         target = existing
         action = "updated"
@@ -118,9 +127,9 @@ def upsert_month(excel_path: str, month_first: datetime.date,
         action = "inserted"
 
     date_cell = ws.cell(row=target, column=COL_DATE,
-                        value=datetime.datetime(month_first.year,
-                                                 month_first.month,
-                                                 month_first.day))
+                        value=datetime.datetime(row_date.year,
+                                                 row_date.month,
+                                                 row_date.day))
     date_cell.number_format = DATE_FMT
 
     deliv_cell = ws.cell(row=target, column=COL_DELIVERY,
